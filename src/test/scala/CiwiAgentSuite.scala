@@ -647,6 +647,74 @@ final class CiwiAgentSuite extends FunSuite {
     }
   }
 
+  test("CiwiAgent.runJob checkout with commit-hash ref succeeds") {
+    val isWindows = System.getProperty("os.name").toLowerCase.contains("win")
+    if (!isWindows) {
+      val statuses = new AtomicReference[List[String]](Nil)
+      withServer { ex =>
+        ex.getRequestURI.getPath match {
+          case "/api/v1/jobs/job-checkout-hash/status" =>
+            val body = readBody(ex)
+            statuses.set(statuses.get() :+ body)
+            respond(ex, 200, "{}")
+          case other =>
+            respond(ex, 404, s"""{"error":"unexpected path $other"}""")
+        }
+      } { base =>
+        val sourceRepo = Files.createTempDirectory("ciwi-source-repo-hash-")
+        val root = Files.createTempDirectory("ciwi-runjob-checkout-hash-")
+        try {
+          runCmd(sourceRepo, List("git", "init"))
+          Files.writeString(sourceRepo.resolve("README.md"), "base\n")
+          runCmd(sourceRepo, List("git", "add", "."))
+          runCmd(sourceRepo, List("git", "-c", "user.email=ciwi@example.local", "-c", "user.name=ciwi", "commit", "-m", "init"))
+
+          runCmd(sourceRepo, List("git", "checkout", "-b", "feature"))
+          Files.writeString(sourceRepo.resolve("feature.txt"), "feature\n")
+          runCmd(sourceRepo, List("git", "add", "."))
+          runCmd(sourceRepo, List("git", "-c", "user.email=ciwi@example.local", "-c", "user.name=ciwi", "commit", "-m", "feature"))
+          val commitHash = runCmdCapture(sourceRepo, List("git", "rev-parse", "HEAD")).trim
+
+          val api = new ApiClient(base, "agent-scala", HttpClient.newHttpClient())
+          val step = JobStepPlanItem(
+            index = 1,
+            total = Some(1),
+            name = Some("verify source hash"),
+            script = Some("test -f feature.txt && echo hash-ok"),
+            kind = Some("run"),
+            testName = None,
+            testFormat = None,
+            testReport = None,
+            coverageFormat = None,
+            coverageReport = None
+          )
+          val job = JobExecution(
+            id = "job-checkout-hash",
+            script = "echo fallback",
+            env = Some(Map.empty),
+            requiredCapabilities = Some(Map("shell" -> "posix")),
+            timeoutSeconds = Some(10),
+            artifactGlobs = None,
+            source = Some(SourceSpec(sourceRepo.toString, Some(commitHash))),
+            metadata = None,
+            stepPlan = Some(List(step))
+          )
+          CiwiAgent.runJob(api, "agent-scala", root, job)
+        } finally {
+          deleteRecursively(sourceRepo)
+          deleteRecursively(root)
+        }
+      }
+
+      val posted = statuses.get()
+      assert(posted.nonEmpty, clues(posted))
+      val finalStatus = posted.last
+      assert(finalStatus.contains("\"status\":\"succeeded\""), clues(finalStatus))
+      assert(finalStatus.contains("hash-ok"), clues(finalStatus))
+      assert(finalStatus.contains("Cloning into"), clues(finalStatus))
+    }
+  }
+
   test("CiwiAgent.runJob emits step.started event and default step metadata") {
     val isWindows = System.getProperty("os.name").toLowerCase.contains("win")
     if (!isWindows) {
@@ -774,5 +842,17 @@ final class CiwiAgentSuite extends FunSuite {
     val exit = proc.waitFor()
     val text = new String(output, StandardCharsets.UTF_8)
     assertEquals(exit, 0, clues(s"command failed: ${cmd.mkString(" ")}\n$text"))
+  }
+
+  private def runCmdCapture(cwd: Path, cmd: List[String]): String = {
+    val pb = new ProcessBuilder(cmd.asJava)
+    pb.directory(cwd.toFile)
+    pb.redirectErrorStream(true)
+    val proc = pb.start()
+    val output = Using.resource(proc.getInputStream)(_.readAllBytes())
+    val exit = proc.waitFor()
+    val text = new String(output, StandardCharsets.UTF_8)
+    assertEquals(exit, 0, clues(s"command failed: ${cmd.mkString(" ")}\n$text"))
+    text
   }
 }
