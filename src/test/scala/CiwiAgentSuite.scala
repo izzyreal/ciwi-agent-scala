@@ -8,8 +8,9 @@ import java.net.http.HttpClient
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
 import java.util.Base64
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import scala.jdk.CollectionConverters._
+import scala.util.Using
 
 final class CiwiAgentSuite extends FunSuite {
 
@@ -58,6 +59,28 @@ final class CiwiAgentSuite extends FunSuite {
       val raw = seenBody.get()
       assert(raw.contains("\"agent_id\":\"agent-scala\""))
       assert(raw.contains("\"hostname\":\"host-a\""))
+    }
+  }
+
+  test("ApiClient.sendHeartbeat includes optional restart status and update failure") {
+    val seenBody = new AtomicReference[String]("")
+    withServer { ex =>
+      assertEquals(ex.getRequestMethod, "POST")
+      assertEquals(ex.getRequestURI.getPath, "/api/v1/heartbeat")
+      seenBody.set(readBody(ex))
+      respond(ex, 200, """{"accepted":true}""")
+    } { base =>
+      val api = new ApiClient(base, "agent-scala", HttpClient.newHttpClient())
+      val resp = api.sendHeartbeat(
+        hostname = "host-a",
+        capabilities = Map("executor" -> "script"),
+        updateFailure = Some("update failed"),
+        restartStatus = Some("restart deferred")
+      )
+      assert(resp.isRight, clues(resp))
+      val raw = seenBody.get()
+      assert(raw.contains("\"update_failure\":\"update failed\""), clues(raw))
+      assert(raw.contains("\"restart_status\":\"restart deferred\""), clues(raw))
     }
   }
 
@@ -209,6 +232,64 @@ final class CiwiAgentSuite extends FunSuite {
     }
   }
 
+  test("DepArtifacts.restore safely skips invalid dependency artifact path") {
+    val root = Files.createTempDirectory("ciwi-dep-artifacts-invalid-path-")
+    try {
+      withServer { ex =>
+        ex.getRequestURI.getPath match {
+          case "/api/v1/jobs/job-build-1/artifacts" =>
+            val payload = """{"artifacts":[{"path":"../escape.txt","url":"/artifacts/job-build-1/escape.txt"}]}"""
+            respond(ex, 200, payload)
+          case _ =>
+            respond(ex, 404, "not found")
+        }
+      } { base =>
+        val api = new ApiClient(base, "agent-scala", HttpClient.newHttpClient())
+        val env = Map("CIWI_DEP_ARTIFACT_JOB_ID" -> "job-build-1")
+        val res = DepArtifacts.restore(api, env, root)
+        assert(res.isRight, clues(res))
+        val note = res.toOption.get
+        assert(note.contains("skip=../escape.txt"), clues(note))
+        assert(note.contains("unsafe_path"), clues(note))
+      }
+    } finally {
+      deleteRecursively(root)
+    }
+  }
+
+  test("DepArtifacts.restore returns failure on partial download errors") {
+    val root = Files.createTempDirectory("ciwi-dep-artifacts-partial-")
+    try {
+      withServer { ex =>
+        ex.getRequestURI.getPath match {
+          case "/api/v1/jobs/job-build-1/artifacts" =>
+            val payload = """{"artifacts":[{"path":"dist/a.bin","url":"/artifacts/job-build-1/dist/a.bin"},{"path":"dist/b.bin","url":"/artifacts/job-build-1/dist/b.bin"}]}"""
+            respond(ex, 200, payload)
+          case "/artifacts/job-build-1/dist/a.bin" =>
+            val bytes = "AAA".getBytes(StandardCharsets.UTF_8)
+            ex.sendResponseHeaders(200, bytes.length.toLong)
+            val out = ex.getResponseBody
+            out.write(bytes)
+            out.close()
+            ex.close()
+          case "/artifacts/job-build-1/dist/b.bin" =>
+            respond(ex, 500, """{"error":"download failed"}""")
+          case _ =>
+            respond(ex, 404, "not found")
+        }
+      } { base =>
+        val api = new ApiClient(base, "agent-scala", HttpClient.newHttpClient())
+        val env = Map("CIWI_DEP_ARTIFACT_JOB_ID" -> "job-build-1")
+        val res = DepArtifacts.restore(api, env, root)
+        assert(res.isLeft, clues(res))
+        assert(res.left.toOption.get.contains("download dependency artifact failed"), clues(res))
+        assertEquals(Files.readString(root.resolve("dist/a.bin")), "AAA")
+      }
+    } finally {
+      deleteRecursively(root)
+    }
+  }
+
   test("TestReports.parseSuite parses go test json report") {
     val root = Files.createTempDirectory("ciwi-test-report-")
     try {
@@ -339,8 +420,359 @@ final class CiwiAgentSuite extends FunSuite {
     }
   }
 
+  test("CiwiAgent.runJob marks final status failed when test report parse fails") {
+    val isWindows = System.getProperty("os.name").toLowerCase.contains("win")
+    if (!isWindows) {
+      val statuses = new AtomicReference[List[String]](Nil)
+      val testsUploadCount = new AtomicInteger(0)
+      withServer { ex =>
+        ex.getRequestURI.getPath match {
+          case "/api/v1/jobs/job-parse-fail/status" =>
+            val body = readBody(ex)
+            statuses.set(statuses.get() :+ body)
+            respond(ex, 200, "{}")
+          case "/api/v1/jobs/job-parse-fail/tests" =>
+            testsUploadCount.incrementAndGet()
+            respond(ex, 200, "{}")
+          case other =>
+            respond(ex, 404, s"""{"error":"unexpected path $other"}""")
+        }
+      } { base =>
+        val root = Files.createTempDirectory("ciwi-runjob-parse-fail-")
+        try {
+          val api = new ApiClient(base, "agent-scala", HttpClient.newHttpClient())
+          val step = JobStepPlanItem(
+            index = 1,
+            total = Some(1),
+            name = Some("unit"),
+            script = Some("echo ok"),
+            kind = Some("test"),
+            testName = Some("unit"),
+            testFormat = Some("go-test-json"),
+            testReport = Some("missing-report.jsonl"),
+            coverageFormat = None,
+            coverageReport = None
+          )
+          val job = JobExecution(
+            id = "job-parse-fail",
+            script = "echo fallback",
+            env = Some(Map.empty),
+            requiredCapabilities = Some(Map("shell" -> "posix")),
+            timeoutSeconds = Some(10),
+            artifactGlobs = None,
+            source = None,
+            metadata = None,
+            stepPlan = Some(List(step))
+          )
+          CiwiAgent.runJob(api, "agent-scala", root, job)
+        } finally {
+          deleteRecursively(root)
+        }
+      }
+
+      val posted = statuses.get()
+      assert(posted.nonEmpty, clues(posted))
+      val finalStatus = posted.last
+      assert(finalStatus.contains("\"status\":\"failed\""), clues(finalStatus))
+      assert(finalStatus.contains("parse_failed"), clues(finalStatus))
+      assertEquals(testsUploadCount.get(), 0)
+    }
+  }
+
+  test("CiwiAgent.runJob keeps final status succeeded when test upload fails") {
+    val isWindows = System.getProperty("os.name").toLowerCase.contains("win")
+    if (!isWindows) {
+      val statuses = new AtomicReference[List[String]](Nil)
+      val testsUploadCount = new AtomicInteger(0)
+      withServer { ex =>
+        ex.getRequestURI.getPath match {
+          case "/api/v1/jobs/job-upload-fail/status" =>
+            val body = readBody(ex)
+            statuses.set(statuses.get() :+ body)
+            respond(ex, 200, "{}")
+          case "/api/v1/jobs/job-upload-fail/tests" =>
+            testsUploadCount.incrementAndGet()
+            respond(ex, 500, """{"error":"boom"}""")
+          case other =>
+            respond(ex, 404, s"""{"error":"unexpected path $other"}""")
+        }
+      } { base =>
+        val root = Files.createTempDirectory("ciwi-runjob-upload-fail-")
+        try {
+          val api = new ApiClient(base, "agent-scala", HttpClient.newHttpClient())
+          val reportScript =
+            """cat > report.jsonl <<'EOF'
+              |{"Action":"pass","Package":"pkg/a","Test":"TestPass","Elapsed":0.02}
+              |EOF""".stripMargin
+          val step = JobStepPlanItem(
+            index = 1,
+            total = Some(1),
+            name = Some("unit"),
+            script = Some(reportScript),
+            kind = Some("test"),
+            testName = Some("unit"),
+            testFormat = Some("go-test-json"),
+            testReport = Some("report.jsonl"),
+            coverageFormat = None,
+            coverageReport = None
+          )
+          val job = JobExecution(
+            id = "job-upload-fail",
+            script = "echo fallback",
+            env = Some(Map.empty),
+            requiredCapabilities = Some(Map("shell" -> "posix")),
+            timeoutSeconds = Some(10),
+            artifactGlobs = None,
+            source = None,
+            metadata = None,
+            stepPlan = Some(List(step))
+          )
+          CiwiAgent.runJob(api, "agent-scala", root, job)
+        } finally {
+          deleteRecursively(root)
+        }
+      }
+
+      val posted = statuses.get()
+      assert(posted.nonEmpty, clues(posted))
+      val finalStatus = posted.last
+      assert(finalStatus.contains("\"status\":\"succeeded\""), clues(finalStatus))
+      assert(finalStatus.contains("upload_failed"), clues(finalStatus))
+      assertEquals(testsUploadCount.get(), 1)
+    }
+  }
+
+  test("CiwiAgent.runJob checkout failure reports failed terminal status") {
+    val statuses = new AtomicReference[List[String]](Nil)
+    withServer { ex =>
+      ex.getRequestURI.getPath match {
+        case "/api/v1/jobs/job-checkout-fail/status" =>
+          val body = readBody(ex)
+          statuses.set(statuses.get() :+ body)
+          respond(ex, 200, "{}")
+        case other =>
+          respond(ex, 404, s"""{"error":"unexpected path $other"}""")
+      }
+    } { base =>
+      val root = Files.createTempDirectory("ciwi-runjob-checkout-fail-")
+      try {
+        val api = new ApiClient(base, "agent-scala", HttpClient.newHttpClient())
+        val job = JobExecution(
+          id = "job-checkout-fail",
+          script = "echo fallback",
+          env = Some(Map.empty),
+          requiredCapabilities = Some(Map("shell" -> "posix")),
+          timeoutSeconds = Some(10),
+          artifactGlobs = None,
+          source = Some(SourceSpec("/definitely/missing/repo/path", Some("main"))),
+          metadata = None,
+          stepPlan = None
+        )
+        CiwiAgent.runJob(api, "agent-scala", root, job)
+      } finally {
+        deleteRecursively(root)
+      }
+    }
+
+    val posted = statuses.get()
+    assert(posted.nonEmpty, clues(posted))
+    val finalStatus = posted.last
+    assert(finalStatus.contains("\"status\":\"failed\""), clues(finalStatus))
+    assert(finalStatus.contains("checkout failed"), clues(finalStatus))
+  }
+
+  test("CiwiAgent.runJob checkout with ref succeeds and reports checkout context") {
+    val isWindows = System.getProperty("os.name").toLowerCase.contains("win")
+    if (!isWindows) {
+      val statuses = new AtomicReference[List[String]](Nil)
+      withServer { ex =>
+        ex.getRequestURI.getPath match {
+          case "/api/v1/jobs/job-checkout-ok/status" =>
+            val body = readBody(ex)
+            statuses.set(statuses.get() :+ body)
+            respond(ex, 200, "{}")
+          case other =>
+            respond(ex, 404, s"""{"error":"unexpected path $other"}""")
+        }
+      } { base =>
+        val sourceRepo = Files.createTempDirectory("ciwi-source-repo-")
+        val root = Files.createTempDirectory("ciwi-runjob-checkout-ok-")
+        try {
+          runCmd(sourceRepo, List("git", "init"))
+          Files.writeString(sourceRepo.resolve("README.md"), "base\n")
+          runCmd(sourceRepo, List("git", "add", "."))
+          runCmd(sourceRepo, List("git", "-c", "user.email=ciwi@example.local", "-c", "user.name=ciwi", "commit", "-m", "init"))
+          runCmd(sourceRepo, List("git", "checkout", "-b", "feature"))
+          Files.writeString(sourceRepo.resolve("feature.txt"), "feature\n")
+          runCmd(sourceRepo, List("git", "add", "."))
+          runCmd(sourceRepo, List("git", "-c", "user.email=ciwi@example.local", "-c", "user.name=ciwi", "commit", "-m", "feature"))
+
+          val api = new ApiClient(base, "agent-scala", HttpClient.newHttpClient())
+          val step = JobStepPlanItem(
+            index = 1,
+            total = Some(1),
+            name = Some("verify source"),
+            script = Some("test -f feature.txt && echo ref-ok"),
+            kind = Some("run"),
+            testName = None,
+            testFormat = None,
+            testReport = None,
+            coverageFormat = None,
+            coverageReport = None
+          )
+          val job = JobExecution(
+            id = "job-checkout-ok",
+            script = "echo fallback",
+            env = Some(Map.empty),
+            requiredCapabilities = Some(Map("shell" -> "posix")),
+            timeoutSeconds = Some(10),
+            artifactGlobs = None,
+            source = Some(SourceSpec(sourceRepo.toString, Some("feature"))),
+            metadata = None,
+            stepPlan = Some(List(step))
+          )
+          CiwiAgent.runJob(api, "agent-scala", root, job)
+        } finally {
+          deleteRecursively(sourceRepo)
+          deleteRecursively(root)
+        }
+      }
+
+      val posted = statuses.get()
+      assert(posted.nonEmpty, clues(posted))
+      val finalStatus = posted.last
+      assert(finalStatus.contains("\"status\":\"succeeded\""), clues(finalStatus))
+      assert(finalStatus.contains("[checkout]"), clues(finalStatus))
+      assert(finalStatus.contains("ref-ok"), clues(finalStatus))
+    }
+  }
+
+  test("CiwiAgent.runJob emits step.started event and default step metadata") {
+    val isWindows = System.getProperty("os.name").toLowerCase.contains("win")
+    if (!isWindows) {
+      val statuses = new AtomicReference[List[String]](Nil)
+      withServer { ex =>
+        ex.getRequestURI.getPath match {
+          case "/api/v1/jobs/job-step-default/status" =>
+            val body = readBody(ex)
+            statuses.set(statuses.get() :+ body)
+            respond(ex, 200, "{}")
+          case other =>
+            respond(ex, 404, s"""{"error":"unexpected path $other"}""")
+        }
+      } { base =>
+        val root = Files.createTempDirectory("ciwi-runjob-step-default-")
+        try {
+          val api = new ApiClient(base, "agent-scala", HttpClient.newHttpClient())
+          val job = JobExecution(
+            id = "job-step-default",
+            script = "echo hello-default-step",
+            env = Some(Map.empty),
+            requiredCapabilities = Some(Map("shell" -> "posix")),
+            timeoutSeconds = Some(10),
+            artifactGlobs = None,
+            source = None,
+            metadata = None,
+            stepPlan = None
+          )
+          CiwiAgent.runJob(api, "agent-scala", root, job)
+        } finally {
+          deleteRecursively(root)
+        }
+      }
+
+      val posted = statuses.get()
+      assert(posted.length >= 3, clues(posted))
+      val withEvent = posted.find(_.contains("\"type\":\"step.started\""))
+      assert(withEvent.nonEmpty, clues(posted))
+      val eventBody = withEvent.get
+      assert(eventBody.contains("\"current_step\":\"[1/1] script\""), clues(eventBody))
+      assert(eventBody.contains("\"name\":\"script\""), clues(eventBody))
+      assert(eventBody.contains("\"kind\":\"run\""), clues(eventBody))
+    }
+  }
+
+  test("ApiClient.reportTerminalStatusWithRetry retries then succeeds") {
+    val attempts = new AtomicInteger(0)
+    withServer { ex =>
+      if (ex.getRequestURI.getPath == "/api/v1/jobs/job-retry-ok/status") {
+        val n = attempts.incrementAndGet()
+        if (n < 3) respond(ex, 500, """{"error":"transient"}""")
+        else respond(ex, 200, "{}")
+      } else {
+        respond(ex, 404, "not found")
+      }
+    } { base =>
+      val api = new ApiClient(base, "agent-scala", HttpClient.newHttpClient(), retryBackoffBaseMillis = 1)
+      val status = JobStatusUpdate("agent-scala", "succeeded", Some(0), None, Some("ok"), None, "2026-02-15T00:00:00Z")
+      val res = api.reportTerminalStatusWithRetry("job-retry-ok", status)
+      assert(res.isRight, clues(res))
+      assertEquals(attempts.get(), 3)
+    }
+  }
+
+  test("ApiClient.reportTerminalStatusWithRetry fails after five attempts") {
+    val attempts = new AtomicInteger(0)
+    withServer { ex =>
+      if (ex.getRequestURI.getPath == "/api/v1/jobs/job-retry-fail/status") {
+        attempts.incrementAndGet()
+        respond(ex, 500, """{"error":"still failing"}""")
+      } else {
+        respond(ex, 404, "not found")
+      }
+    } { base =>
+      val api = new ApiClient(base, "agent-scala", HttpClient.newHttpClient(), retryBackoffBaseMillis = 1)
+      val status = JobStatusUpdate("agent-scala", "failed", Some(1), Some("err"), Some("log"), None, "2026-02-15T00:00:00Z")
+      val res = api.reportTerminalStatusWithRetry("job-retry-fail", status)
+      assert(res.isLeft, clues(res))
+      assert(res.left.toOption.get.contains("after 5 attempts"), clues(res))
+      assertEquals(attempts.get(), 5)
+    }
+  }
+
+  test("CiwiAgent.detectToolVersion parses semver from command output") {
+    val isWindows = System.getProperty("os.name").toLowerCase.contains("win")
+    if (!isWindows) {
+      val gitVersion = CiwiAgent.detectToolVersion("sh", List("-lc", "echo git version 2.45.1"))
+      assertEquals(gitVersion, "2.45.1")
+      val goVersion = CiwiAgent.detectToolVersion("sh", List("-lc", "echo go version go1.24.2 darwin/arm64"))
+      assertEquals(goVersion, "1.24.2")
+    }
+  }
+
+  test("CiwiAgent.applyHeartbeatDirectives refreshes capabilities and sets restart status") {
+    val hb = HeartbeatResponse(
+      accepted = true,
+      message = None,
+      updateRequested = None,
+      updateTarget = None,
+      refreshToolsRequested = Some(true),
+      restartRequested = Some(true)
+    )
+    val (capabilities, restartStatus, refreshed) = CiwiAgent.applyHeartbeatDirectives(
+      hb = hb,
+      currentCapabilities = Map("executor" -> "script", "shells" -> "posix"),
+      capabilityDetector = () => Map("executor" -> "script", "shells" -> "posix", "tool.git" -> "2.45.1")
+    )
+    assertEquals(refreshed, true)
+    assertEquals(capabilities.get("tool.git"), Some("2.45.1"))
+    assert(restartStatus.nonEmpty, clues(restartStatus))
+    assert(restartStatus.get.contains("not implemented"), clues(restartStatus))
+  }
+
   private def deleteRecursively(path: Path): Unit = {
     if (Files.notExists(path)) return
     Files.walk(path).iterator().asScala.toList.reverse.foreach(p => Files.deleteIfExists(p))
+  }
+
+  private def runCmd(cwd: Path, cmd: List[String]): Unit = {
+    val pb = new ProcessBuilder(cmd.asJava)
+    pb.directory(cwd.toFile)
+    pb.redirectErrorStream(true)
+    val proc = pb.start()
+    val output = Using.resource(proc.getInputStream)(_.readAllBytes())
+    val exit = proc.waitFor()
+    val text = new String(output, StandardCharsets.UTF_8)
+    assertEquals(exit, 0, clues(s"command failed: ${cmd.mkString(" ")}\n$text"))
   }
 }

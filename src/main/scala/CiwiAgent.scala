@@ -17,6 +17,7 @@ import scala.collection.mutable
 import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
+import scala.util.matching.Regex
 
 final case class SourceSpec(repo: String, ref: Option[String])
 
@@ -356,8 +357,15 @@ object Codecs {
 }
 
 
-final class ApiClient(serverUrl: String, agentId: String, http: HttpClient) {
+final class ApiClient(
+  serverUrl: String,
+  agentId: String,
+  http: HttpClient,
+  retryBackoffBaseMillis: Long = 1000L
+) {
   import Codecs.given
+
+  private[agent] def sleepMillis(ms: Long): Unit = Thread.sleep(ms)
 
   private def trimSlash(s: String): String = s.stripSuffix("/")
   private val base = trimSlash(serverUrl)
@@ -390,7 +398,12 @@ final class ApiClient(serverUrl: String, agentId: String, http: HttpClient) {
     else Left(s"status=${resp.statusCode()} body=${resp.body().trim}")
   }
 
-  def sendHeartbeat(hostname: String, capabilities: Map[String, String]): Either[String, HeartbeatResponse] = {
+  def sendHeartbeat(
+    hostname: String,
+    capabilities: Map[String, String],
+    updateFailure: Option[String] = None,
+    restartStatus: Option[String] = None
+  ): Either[String, HeartbeatResponse] = {
     val req = HeartbeatRequest(
       agentId = agentId,
       hostname = hostname,
@@ -398,8 +411,8 @@ final class ApiClient(serverUrl: String, agentId: String, http: HttpClient) {
       arch = System.getProperty("os.arch").toLowerCase,
       version = "scala-agent-dev",
       capabilities = capabilities,
-      updateFailure = None,
-      restartStatus = None,
+      updateFailure = updateFailure.map(_.trim).filter(_.nonEmpty),
+      restartStatus = restartStatus.map(_.trim).filter(_.nonEmpty),
       timestampUtc = Instant.now().toString
     )
     sendJson("/api/v1/heartbeat", req).flatMap { raw =>
@@ -430,8 +443,8 @@ final class ApiClient(serverUrl: String, agentId: String, http: HttpClient) {
         case Left(err) =>
           lastErr = err
           if (attempt < 5) {
-            val waitSecs = Math.pow(2.0, (attempt - 1).toDouble).toLong
-            Thread.sleep(waitSecs * 1000)
+            val waitMillis = retryBackoffBaseMillis * Math.pow(2.0, (attempt - 1).toDouble).toLong
+            sleepMillis(waitMillis)
           }
       }
       attempt += 1
@@ -887,9 +900,21 @@ object CommandRunner {
 object CiwiAgent {
   private val heartbeatInterval = 10.seconds
   private val leaseInterval = 3.seconds
+  private val versionPattern: Regex = raw"([0-9]+(?:\.[0-9]+){1,3})".r
+  private val restartRequestedStatusMessage = "restart requested but not implemented in scala agent"
 
   private def env(name: String, default: String): String = Option(System.getenv(name)).map(_.trim).filter(_.nonEmpty).getOrElse(default)
   private def envOpt(name: String): Option[String] = Option(System.getenv(name)).map(_.trim).filter(_.nonEmpty)
+  private def boolEnv(name: String, default: Boolean): Boolean = {
+    envOpt(name)
+      .map(_.toLowerCase)
+      .map {
+        case "1" | "true" | "yes" | "on" => true
+        case "0" | "false" | "no" | "off" => false
+        case _ => default
+      }
+      .getOrElse(default)
+  }
 
   private def loadOrCreateAgentId(workDir: Path): String = {
     val host = java.net.InetAddress.getLocalHost.getHostName
@@ -905,16 +930,76 @@ object CiwiAgent {
     base
   }
 
-  private def detectCapabilities(): Map[String, String] = {
+  private[agent] def detectToolVersion(cmd: String, args: List[String]): String = {
+    try {
+      val pb = new ProcessBuilder((cmd :: args).asJava)
+      pb.redirectErrorStream(true)
+      val proc = pb.start()
+      val done = proc.waitFor(2, TimeUnit.SECONDS)
+      if (!done) {
+        proc.destroyForcibly()
+        proc.waitFor(1, TimeUnit.SECONDS)
+        return ""
+      }
+      val text = new String(proc.getInputStream.readAllBytes(), StandardCharsets.UTF_8).trim
+      if (text.isEmpty) return ""
+      val normalized =
+        if (text.contains("go version go")) text.replace("go version go", "go version ")
+        else text
+      versionPattern.findFirstMatchIn(normalized).map(_.group(1)).getOrElse("")
+    } catch {
+      case NonFatal(_) => ""
+    }
+  }
+
+  private[agent] def detectToolVersions(): Map[String, String] = {
+    val tools = List(
+      ("git", "git", List("--version")),
+      ("go", "go", List("version")),
+      ("gh", "gh", List("--version")),
+      ("cmake", "cmake", List("--version")),
+      ("ninja", "ninja", List("--version")),
+      ("docker", "docker", List("--version")),
+      ("gcc", "gcc", List("--version")),
+      ("clang", "clang", List("--version")),
+      ("xcodebuild", "xcodebuild", List("-version"))
+    )
+    tools.flatMap { case (name, cmd, args) =>
+      val v = detectToolVersion(cmd, args)
+      if (v.nonEmpty) Some(name -> v) else None
+    }.toMap
+  }
+
+  private[agent] def detectCapabilities(): Map[String, String] = {
     val os = System.getProperty("os.name").toLowerCase
     val arch = System.getProperty("os.arch").toLowerCase
     val shells = if (os.contains("win")) "cmd,powershell" else "posix"
-    Map(
+    val base = Map(
       "executor" -> "script",
       "shells" -> shells,
       "os" -> (if (os.contains("mac")) "darwin" else if (os.contains("win")) "windows" else "linux"),
       "arch" -> arch
     )
+    val toolCaps = detectToolVersions().map { case (name, version) => s"tool.$name" -> version }
+    base ++ toolCaps
+  }
+
+  private[agent] def applyHeartbeatDirectives(
+    hb: HeartbeatResponse,
+    currentCapabilities: Map[String, String],
+    capabilityDetector: () => Map[String, String]
+  ): (Map[String, String], Option[String], Boolean) = {
+    var capabilities = currentCapabilities
+    var refreshed = false
+    var restartStatus: Option[String] = None
+    if (hb.refreshToolsRequested.getOrElse(false)) {
+      capabilities = capabilityDetector()
+      refreshed = true
+    }
+    if (hb.restartRequested.getOrElse(false)) {
+      restartStatus = Some(restartRequestedStatusMessage)
+    }
+    (capabilities, restartStatus, refreshed)
   }
 
   private def leaseShell(required: Map[String, String]): String = {
@@ -950,7 +1035,7 @@ object CiwiAgent {
 
   private def nowIso: String = Instant.now().toString
 
-  private def runJob(api: ApiClient, agentId: String, workDir: Path, job: JobExecution): Unit = {
+  private[agent] def runJob(api: ApiClient, agentId: String, workDir: Path, job: JobExecution): Unit = {
     val running = JobStatusUpdate(
       agentId = agentId,
       status = "running",
@@ -999,6 +1084,7 @@ object CiwiAgent {
     val timeout = job.timeoutSeconds.getOrElse(0)
     val shell = leaseShell(job.requiredCapabilities.getOrElse(Map.empty))
     val env = mergeEnv(jobEnv)
+    val traceShell = boolEnv("CIWI_AGENT_TRACE_SHELL", default = true)
 
     def trimOutput(raw: String): String = if (raw.length <= 1024 * 1024) raw else raw.takeRight(1024 * 1024)
     def stepLabel(step: JobStepPlanItem): String = {
@@ -1058,8 +1144,11 @@ object CiwiAgent {
       } else {
         val script = step.script.map(_.trim).getOrElse("")
         if (script.nonEmpty) {
+          val effectiveScript =
+            if (shell == "posix" && traceShell) "set -x\n" + script
+            else script
           val result = try {
-            CommandRunner.run(shell, script, baseExecDir, env, timeout)
+            CommandRunner.run(shell, effectiveScript, baseExecDir, env, timeout)
           } catch {
             case NonFatal(e) => CommandRunner.Result(-1, s"[run-error] ${e.getMessage}\n", timedOut = false)
           }
@@ -1151,7 +1240,9 @@ object CiwiAgent {
 
     val http = HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(20)).build()
     val api = new ApiClient(serverUrl, agentId, http)
-    val capabilities = detectCapabilities()
+    var capabilities = detectCapabilities()
+    var pendingUpdateFailure: Option[String] = None
+    var pendingRestartStatus: Option[String] = None
 
     @volatile var running = true
     Runtime.getRuntime.addShutdownHook(Thread(() => running = false))
@@ -1183,9 +1274,33 @@ object CiwiAgent {
       }
 
       if (now.isAfter(nextHeartbeat)) {
-        api.sendHeartbeat(hostname, capabilities) match {
+        api.sendHeartbeat(hostname, capabilities, pendingUpdateFailure, pendingRestartStatus) match {
           case Left(err) => println(s"[agent] heartbeat failed: $err")
-          case Right(_)  =>
+          case Right(hb) =>
+            pendingUpdateFailure = None
+            pendingRestartStatus = None
+            val (updatedCapabilities, restartStatus, refreshed) =
+              applyHeartbeatDirectives(hb, capabilities, () => detectCapabilities())
+            capabilities = updatedCapabilities
+            if (refreshed) {
+              println("[agent] server requested tools refresh")
+              api.sendHeartbeat(hostname, capabilities, pendingUpdateFailure, pendingRestartStatus) match {
+                case Left(err) => println(s"[agent] heartbeat failed: $err")
+                case Right(_) =>
+                  pendingUpdateFailure = None
+                  pendingRestartStatus = None
+              }
+            }
+            if (restartStatus.nonEmpty) {
+              pendingRestartStatus = restartStatus
+              println(s"[agent] ${restartStatus.get}")
+              api.sendHeartbeat(hostname, capabilities, pendingUpdateFailure, pendingRestartStatus) match {
+                case Left(err) => println(s"[agent] heartbeat failed while reporting restart status: $err")
+                case Right(_) =>
+                  pendingUpdateFailure = None
+                  pendingRestartStatus = None
+              }
+            }
         }
         nextHeartbeat = Instant.now().plusMillis(heartbeatInterval.toMillis)
       }
