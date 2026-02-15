@@ -7,6 +7,6 @@ lazy val root = (project in file("."))
     libraryDependencies ++= Seq(
       "io.circe" %% "circe-core" % "0.14.10",
       "io.circe" %% "circe-parser" % "0.14.10",
-      "io.circe" %% "circe-generic-extras" % "0.14.4"
+      "org.scalameta" %% "munit" % "1.0.0" % Test
     )
   )
