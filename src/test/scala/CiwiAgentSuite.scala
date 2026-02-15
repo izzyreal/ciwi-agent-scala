@@ -828,6 +828,25 @@ final class CiwiAgentSuite extends FunSuite {
     assert(restartStatus.get.contains("not implemented"), clues(restartStatus))
   }
 
+  test("AgentCore.parseBoolean handles truthy, falsy and fallback values") {
+    assertEquals(AgentCore.parseBoolean(Some("yes"), default = false), true)
+    assertEquals(AgentCore.parseBoolean(Some("off"), default = true), false)
+    assertEquals(AgentCore.parseBoolean(Some("invalid"), default = true), true)
+    assertEquals(AgentCore.parseBoolean(None, default = false), false)
+  }
+
+  test("AgentCore base capabilities and tool capabilities compose deterministically") {
+    val base = AgentCore.baseCapabilities("Mac OS X", "arm64")
+    assertEquals(base("executor"), "script")
+    assertEquals(base("shells"), "posix")
+    assertEquals(base("os"), "darwin")
+    assertEquals(base("arch"), "arm64")
+
+    val merged = AgentCore.withToolCapabilities(base, Map("git" -> "2.45.1"))
+    assertEquals(merged("tool.git"), "2.45.1")
+    assertEquals(merged("executor"), "script")
+  }
+
   private def deleteRecursively(path: Path): Unit = {
     if (Files.notExists(path)) return
     Files.walk(path).iterator().asScala.toList.reverse.foreach(p => Files.deleteIfExists(p))
