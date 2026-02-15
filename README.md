@@ -1,6 +1,6 @@
 # ciwi-agent-scala
 
-Scala 3 agent-only implementation for ciwi.
+Scala 3 agent-only implementation for [ciwi](https://github.com/izzyreal/ciwi).
 
 ## Scope
 - Heartbeat: `POST /api/v1/heartbeat`
